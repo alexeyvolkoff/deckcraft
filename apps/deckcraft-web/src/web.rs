@@ -56,7 +56,7 @@ pub fn start() {
                         log::error!("new presentation: {e}");
                     }
                     if let Some(bridge) = &app_bridge {
-                        bridge.listen();
+                        bridge.listen(cc.egui_ctx.clone());
                         bridge.post_ready();
                     }
                     if q.contains("show") {
@@ -123,12 +123,32 @@ impl eframe::App for WebShell {
         if let Some(bridge) = &self.bridge {
             for (name, bytes) in bridge.take_incoming() {
                 self.app.open_or_insert_bytes(&name, &bytes);
-                // Saving keeps the format the deck came in as.
+                // Remember the presentation the host opened (docClosed tracking) and keep
+                // saving in the format the deck came in as.
+                let is_deck_file = name.rsplit('.').next().is_some_and(|ext| {
+                    ["pptx", "potx", "ppsx", "deckcraft"].iter().any(|e| ext.eq_ignore_ascii_case(e))
+                });
+                if is_deck_file
+                    && let Some(d) = self.app.session.active()
+                {
+                    bridge.set_host_uid(d.uid);
+                }
                 let ext = name.rsplit('.').next().map(str::to_ascii_lowercase);
                 if matches!(ext.as_deref(), Some("pptx" | "potx" | "ppsx")) {
                     self.app.web_save_format = Some(ext.unwrap_or_else(|| "pptx".into()));
                 }
                 ctx.request_repaint();
+            }
+            // Commands the host sent (`deckcraft:cmd`): run them like ribbon buttons.
+            for (id, params) in bridge.take_commands() {
+                let parsed: serde_json::Value = serde_json::from_str(&params).unwrap_or(serde_json::Value::Null);
+                match self.app.run(&id, parsed) {
+                    Ok(v) => {
+                        let detail = if id == "file.close" { format!("docs={}", self.app.session.documents().len()) } else { v.to_string() };
+                        bridge.post_response(true, &detail);
+                    }
+                    Err(e) => bridge.post_response(false, &e),
+                }
             }
         }
         self.app.logic(ctx);
