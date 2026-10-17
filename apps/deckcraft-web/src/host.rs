@@ -1,0 +1,218 @@
+//! The `postMessage` bridge to a same-origin parent page (`?host=parent`), for pages that embed
+//! DeckCraft in an `<iframe>`. Same protocol as GridCraft's host bridge, with `deckcraft:`
+//! message types:
+//!
+//! - `deckcraft:ready` (to the parent): `{ version }`, the app is listening; send a deck now.
+//! - `deckcraft:open` (from the parent): `{ name, bytes }`, bytes an `ArrayBuffer` or
+//!   `Uint8Array`. It opens like a presentation dropped on the window.
+//! - `deckcraft:save` (to the parent): `{ name, bytes }` (a transferred `ArrayBuffer`) for every
+//!   file DeckCraft would otherwise download: Save/Save As and the PDF/PNG/GIF exports. The
+//!   parent stores it and reports failures itself.
+//! - `deckcraft:dirty` (to the parent): `{ dirty }` whenever unsaved changes appear or go away.
+//! - `deckcraft:failed` (to the parent): `{ error }` when the app couldn't start.
+//!
+//! Only the parent window on the page's own origin is heard or answered. In host mode the page
+//! starts with an empty presentation instead of the sample deck.
+
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+use deckcraft_ui_egui::{Services, SlideApp};
+use wasm_bindgen::JsCast as _;
+use wasm_bindgen::JsValue;
+use wasm_bindgen::closure::Closure;
+
+/// Files saved under these extensions hand the whole deck to the parent, which stores it: the
+/// deck counts as saved under that name, as it would after Save on the desktop. Exports (PDF,
+/// PNG, GIF) go to the parent too but don't mark the deck saved.
+const DECK_EXTS: &[&str] = &["pptx", "deckcraft"];
+
+#[derive(Clone)]
+pub struct Bridge {
+    window: web_sys::Window,
+    parent: web_sys::Window,
+    origin: String,
+    /// Files the parent sent since the last frame: (name, bytes).
+    incoming: Rc<RefCell<Vec<(String, Vec<u8>)>>>,
+    /// Names of the decks handed to the parent since the last frame.
+    saved: Rc<RefCell<Vec<String>>>,
+    /// The unsaved-changes state last reported to the parent.
+    reported: Rc<Cell<Option<bool>>>,
+    /// Whether a "no presentations" state was reported (so docClosed fires once).
+    closed_reported: Rc<Cell<bool>>,
+    /// Commands the parent sent since the last frame: (id, params JSON string).
+    commands: Rc<RefCell<Vec<(String, String)>>>,
+    /// The uid of the presentation the host opened (the session keeps a blank deck around,
+    /// so "closed" means the uid vanishing, not an empty document list).
+    host_uid: Rc<Cell<Option<u64>>>,
+}
+
+impl Bridge {
+    /// `None` when the page isn't framed (there is no parent to talk to).
+    pub fn new() -> Option<Self> {
+        let window = web_sys::window()?;
+        let parent = window.parent().ok().flatten()?;
+        if js_sys::Object::is(&parent, &window) {
+            return None;
+        }
+        let origin = window.location().origin().ok()?;
+        Some(Self {
+            window,
+            parent,
+            origin,
+            incoming: Rc::default(),
+            saved: Rc::default(),
+            reported: Rc::default(),
+            closed_reported: Rc::default(),
+            commands: Rc::default(),
+            host_uid: Rc::default(),
+        })
+    }
+
+    /// Remember the presentation the host opened, to notice it closing later.
+    pub fn set_host_uid(&self, uid: u64) {
+        self.host_uid.set(Some(uid));
+        self.closed_reported.set(false);
+    }
+
+    /// Send saved and exported files to the parent instead of downloading them.
+    pub fn connect(&self, services: &mut Services) {
+        let bridge = self.clone();
+        services.download = Some(Box::new(move |name: &str, bytes: &[u8]| {
+            if let Err(e) = bridge.post_save(name, bytes) {
+                log::error!("couldn't hand {name} to the page: {e}");
+            }
+        }));
+    }
+
+    /// Files the parent sent since the last frame, oldest first.
+    pub fn take_incoming(&self) -> Vec<(String, Vec<u8>)> {
+        std::mem::take(&mut *self.incoming.borrow_mut())
+    }
+
+    /// Commands the parent sent since the last frame, oldest first: (id, params JSON).
+    pub fn take_commands(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.commands.borrow_mut())
+    }
+
+    pub fn post_ready(&self) {
+        self.send(&[("type", "deckcraft:ready".into()), ("version", env!("CARGO_PKG_VERSION").into())]);
+    }
+
+    /// How a host command ended (`deckcraft:cmd`): value or error as JSON strings.
+    pub fn post_response(&self, ok: bool, text: &str) {
+        self.send(&[("type", "deckcraft:response".into()), ("ok", ok.into()), ("value", text.into())]);
+    }
+
+    pub fn post_failed(&self, error: &str) {
+        self.send(&[("type", "deckcraft:failed".into()), ("error", error.into())]);
+    }
+
+    /// After each frame: a deck handed to the parent this frame counts as saved, and the parent
+    /// hears when unsaved changes appear or go away. When the last presentation closes
+    /// (File › Close), the parent hears `docClosed` once.
+    pub fn sync(&self, app: &mut SlideApp) {
+        let saved = std::mem::take(&mut *self.saved.borrow_mut());
+        if saved.iter().any(|name| is_deck(name))
+            && let Some(doc) = app.session.active_mut()
+        {
+            doc.saved_doc = doc.doc.clone();
+        }
+        let dirty = app.session.documents().iter().any(|d| d.is_dirty());
+        if self.reported.get() != Some(dirty) && self.send(&[("type", "deckcraft:dirty".into()), ("dirty", dirty.into())]) {
+            self.reported.set(Some(dirty));
+        }
+        // The host's presentation closed (File › Close): the session keeps a blank deck around,
+        // so the host's one is gone when its uid no longer appears in the document list.
+        if let Some(uid) = self.host_uid.get()
+            && !app.session.documents().iter().any(|d| d.uid == uid)
+        {
+            self.host_uid.set(None);
+            self.send(&[("type", "deckcraft:docClosed".into())]);
+        }
+    }
+
+    fn post_save(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        let name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string());
+        let buffer = js_sys::Uint8Array::from(bytes).buffer();
+        let message = message(&[
+            ("type", "deckcraft:save".into()),
+            ("name", name.as_str().into()),
+            ("bytes", buffer.clone().into()),
+        ])
+        .ok_or_else(|| "couldn't build the message".to_string())?;
+        self.parent
+            .post_message_with_transfer(&message, &self.origin, &js_sys::Array::of1(&buffer))
+            .map_err(|e| e.as_string().unwrap_or_else(|| format!("{e:?}")))?;
+        self.saved.borrow_mut().push(name);
+        Ok(())
+    }
+
+    pub fn listen(&self, ctx: egui::Context) {
+        let parent = self.parent.clone();
+        let origin = self.origin.clone();
+        let incoming = self.incoming.clone();
+        let commands = self.commands.clone();
+        let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
+            if event.origin() != origin || !event.source().is_some_and(|s| js_sys::Object::is(&s, &parent)) {
+                return;
+            }
+            let data = event.data();
+            match string(&data, "type").as_deref() {
+                Some("deckcraft:open") => {
+                    let name = string(&data, "name").filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "deck.pptx".to_string());
+                    let Some(bytes) = bytes(&data) else { return };
+                    incoming.borrow_mut().push((name, bytes));
+                    ctx.request_repaint();
+                }
+                Some("deckcraft:cmd") => {
+                    let Some(id) = string(&data, "id").filter(|i| !i.trim().is_empty()) else { return };
+                    let params = string(&data, "params").unwrap_or_else(|| "{}".into());
+                    commands.borrow_mut().push((id, params));
+                    ctx.request_repaint();
+                }
+                _ => {}
+            }
+        });
+        if self.window.add_event_listener_with_callback("message", on_message.as_ref().unchecked_ref()).is_ok() {
+            // The listener lives as long as the page.
+            on_message.forget();
+        }
+    }
+
+    /// Post a message to the parent; false if it couldn't be sent.
+    fn send(&self, fields: &[(&str, JsValue)]) -> bool {
+        message(fields).is_some_and(|m| self.parent.post_message(&m, &self.origin).is_ok())
+    }
+}
+
+fn message(fields: &[(&str, JsValue)]) -> Option<js_sys::Object> {
+    let m = js_sys::Object::new();
+    for (key, value) in fields {
+        js_sys::Reflect::set(&m, &JsValue::from_str(key), value).ok()?;
+    }
+    Some(m)
+}
+
+fn is_deck(name: &str) -> bool {
+    name.rsplit_once('.').is_some_and(|(_, ext)| DECK_EXTS.iter().any(|e| ext.eq_ignore_ascii_case(e)))
+}
+
+fn string(data: &JsValue, key: &str) -> Option<String> {
+    js_sys::Reflect::get(data, &JsValue::from_str(key)).ok()?.as_string()
+}
+
+/// `bytes` as an `ArrayBuffer` or `Uint8Array`.
+fn bytes(data: &JsValue) -> Option<Vec<u8>> {
+    let bytes = js_sys::Reflect::get(data, &JsValue::from_str("bytes")).ok()?;
+    if let Some(array) = bytes.dyn_ref::<js_sys::Uint8Array>() {
+        Some(array.to_vec())
+    } else if bytes.is_instance_of::<js_sys::ArrayBuffer>() {
+        Some(js_sys::Uint8Array::new(&bytes).to_vec())
+    } else {
+        None
+    }
+}
