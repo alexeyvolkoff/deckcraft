@@ -46,8 +46,8 @@ pub fn start() {
                         bridge.connect(&mut services);
                     }
                     let mut app = SlideApp::new(Session::new(), services);
-                    // In host mode the parent sends the deck to edit; no sample meanwhile.
-                    let q = if app_bridge.is_some() { String::new() } else { query() };
+                    // In host mode the parent sends the deck to edit; start blank, no sample meanwhile.
+                    let q = if app_bridge.is_some() { "blank".to_string() } else { query() };
                     if !q.contains("blank") {
                         if let Err(e) = deckcraft_engine::sample::open_sample(&mut app.session) {
                             log::error!("sample deck: {e}");
@@ -135,7 +135,12 @@ impl eframe::App for WebShell {
                 }
                 let ext = name.rsplit('.').next().map(str::to_ascii_lowercase);
                 if matches!(ext.as_deref(), Some("pptx" | "potx" | "ppsx")) {
-                    self.app.web_save_format = Some(ext.unwrap_or_else(|| "pptx".into()));
+                    // save_as_dialog writes PowerPoint formats as .pptx and .deckcraft files
+                    // as .deckcraft: potx/ppsx decks save back through the pptx branch.
+                    self.app.web_save_format = Some(match ext.as_deref() {
+                        Some("potx" | "ppsx") => "pptx".to_string(),
+                        _ => ext.unwrap_or_else(|| "pptx".into()),
+                    });
                 }
                 ctx.request_repaint();
             }
