@@ -10,6 +10,11 @@
 //!   parent stores it and reports failures itself.
 //! - `deckcraft:dirty` (to the parent): `{ dirty }` whenever unsaved changes appear or go away.
 //! - `deckcraft:failed` (to the parent): `{ error }` when the app couldn't start.
+//! - `deckcraft:cmd` (from the parent): `{ id, params?, requestId? }` runs the engine command `id`
+//!   in the open presentation, like a ribbon button. `params` is a JSON string (absent means `{}`)
+//!   and `requestId` an optional string that comes back in the response.
+//! - `deckcraft:response` (to the parent): `{ id, requestId?, ok, value? }` or
+//!   `{ id, requestId?, ok: false, error }` for every `deckcraft:cmd`, once it has run.
 //!
 //! Only the parent window on the page's own origin is heard or answered. In host mode the page
 //! starts with an empty presentation instead of the sample deck.
@@ -18,9 +23,12 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use deckcraft_ui_egui::{Services, SlideApp};
+use serde_json::Value;
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::JsValue;
 use wasm_bindgen::closure::Closure;
+
+use crate::host_cmd;
 
 /// Files saved under these extensions hand the whole deck to the parent, which stores it: the
 /// deck counts as saved under that name, as it would after Save on the desktop. Exports (PDF,
@@ -40,8 +48,8 @@ pub struct Bridge {
     reported: Rc<Cell<Option<bool>>>,
     /// Whether a "no presentations" state was reported (so docClosed fires once).
     closed_reported: Rc<Cell<bool>>,
-    /// Commands the parent sent since the last frame: (id, params JSON string).
-    commands: Rc<RefCell<Vec<(String, String)>>>,
+    /// Commands the parent sent since the last frame: (id, params, request id).
+    commands: Rc<RefCell<Vec<(String, Value, Option<String>)>>>,
     /// The uid of the presentation the host opened (the session keeps a blank deck around,
     /// so "closed" means the uid vanishing, not an empty document list).
     host_uid: Rc<Cell<Option<u64>>>,
@@ -55,7 +63,9 @@ impl Bridge {
         if js_sys::Object::is(&parent, &window) {
             return None;
         }
-        let origin = window.location().origin().ok()?;
+        // A sandboxed frame has the opaque origin "null": no sender can be vetted and nothing
+        // can be addressed to the parent, so the bridge stays off.
+        let origin = window.location().origin().ok().filter(|o| !matches!(o.as_str(), "" | "null" | "*"))?;
         Some(Self {
             window,
             parent,
@@ -90,8 +100,8 @@ impl Bridge {
         std::mem::take(&mut *self.incoming.borrow_mut())
     }
 
-    /// Commands the parent sent since the last frame, oldest first: (id, params JSON).
-    pub fn take_commands(&self) -> Vec<(String, String)> {
+    /// Commands the parent sent since the last frame, oldest first: (id, params, request id).
+    pub fn take_commands(&self) -> Vec<(String, Value, Option<String>)> {
         std::mem::take(&mut *self.commands.borrow_mut())
     }
 
@@ -99,9 +109,33 @@ impl Bridge {
         self.send(&[("type", "deckcraft:ready".into()), ("version", env!("CARGO_PKG_VERSION").into())]);
     }
 
-    /// How a host command ended (`deckcraft:cmd`): value or error as JSON strings.
-    pub fn post_response(&self, ok: bool, text: &str) {
-        self.send(&[("type", "deckcraft:response".into()), ("ok", ok.into()), ("value", text.into())]);
+    /// Tell the parent how a command (`deckcraft:cmd`) ended.
+    pub fn post_response(&self, id: &str, request_id: Option<&str>, result: Result<Value, String>) {
+        let value = host_cmd::response(id, request_id, result);
+        let sent = js_sys::JSON::parse(&value.to_string()).ok().is_some_and(|m| self.parent.post_message(&m, &self.origin).is_ok());
+        if !sent {
+            log::error!("couldn't answer command {id} to the page");
+        }
+    }
+
+    /// Queue the command in a `deckcraft:cmd` message, or answer the parent at once when the
+    /// message doesn't fit.
+    fn receive_command(&self, data: &JsValue) {
+        let params = js_sys::Reflect::get(data, &JsValue::from_str("params")).ok().filter(|v| !v.is_undefined() && !v.is_null());
+        let params = match params {
+            None => Some(None),
+            Some(v) => v.as_string().map(Some),
+        };
+        let id = string(data, "id");
+        let request_id = string(data, "requestId");
+        let parsed = match params {
+            Some(params) => host_cmd::parse(id.clone(), Some(params), request_id.clone()),
+            None => Err("params must be a string of valid JSON".to_string()),
+        };
+        match parsed {
+            Ok(c) => self.commands.borrow_mut().push((c.id, c.params, c.request_id)),
+            Err(error) => self.post_response(id.as_deref().unwrap_or(""), request_id.as_deref(), Err(error)),
+        }
     }
 
     pub fn post_failed(&self, error: &str) {
@@ -133,17 +167,10 @@ impl Bridge {
     }
 
     fn post_save(&self, path: &str, bytes: &[u8]) -> Result<(), String> {
-        let name = std::path::Path::new(path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.to_string());
+        let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| path.to_string());
         let buffer = js_sys::Uint8Array::from(bytes).buffer();
-        let message = message(&[
-            ("type", "deckcraft:save".into()),
-            ("name", name.as_str().into()),
-            ("bytes", buffer.clone().into()),
-        ])
-        .ok_or_else(|| "couldn't build the message".to_string())?;
+        let message = message(&[("type", "deckcraft:save".into()), ("name", name.as_str().into()), ("bytes", buffer.clone().into())])
+            .ok_or_else(|| "couldn't build the message".to_string())?;
         self.parent
             .post_message_with_transfer(&message, &self.origin, &js_sys::Array::of1(&buffer))
             .map_err(|e| e.as_string().unwrap_or_else(|| format!("{e:?}")))?;
@@ -155,7 +182,7 @@ impl Bridge {
         let parent = self.parent.clone();
         let origin = self.origin.clone();
         let incoming = self.incoming.clone();
-        let commands = self.commands.clone();
+        let bridge = self.clone();
         let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
             if event.origin() != origin || !event.source().is_some_and(|s| js_sys::Object::is(&s, &parent)) {
                 return;
@@ -169,9 +196,7 @@ impl Bridge {
                     ctx.request_repaint();
                 }
                 Some("deckcraft:cmd") => {
-                    let Some(id) = string(&data, "id").filter(|i| !i.trim().is_empty()) else { return };
-                    let params = string(&data, "params").unwrap_or_else(|| "{}".into());
-                    commands.borrow_mut().push((id, params));
+                    bridge.receive_command(&data);
                     ctx.request_repaint();
                 }
                 _ => {}

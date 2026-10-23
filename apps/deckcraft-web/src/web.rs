@@ -125,12 +125,9 @@ impl eframe::App for WebShell {
                 self.app.open_or_insert_bytes(&name, &bytes);
                 // Remember the presentation the host opened (docClosed tracking) and keep
                 // saving in the format the deck came in as.
-                let is_deck_file = name.rsplit('.').next().is_some_and(|ext| {
-                    ["pptx", "potx", "ppsx", "deckcraft"].iter().any(|e| ext.eq_ignore_ascii_case(e))
-                });
-                if is_deck_file
-                    && let Some(d) = self.app.session.active()
-                {
+                let is_deck_file =
+                    name.rsplit('.').next().is_some_and(|ext| ["pptx", "potx", "ppsx", "deckcraft"].iter().any(|e| ext.eq_ignore_ascii_case(e)));
+                if is_deck_file && let Some(d) = self.app.session.active() {
                     bridge.set_host_uid(d.uid);
                 }
                 let ext = name.rsplit('.').next().map(str::to_ascii_lowercase);
@@ -145,15 +142,12 @@ impl eframe::App for WebShell {
                 ctx.request_repaint();
             }
             // Commands the host sent (`deckcraft:cmd`): run them like ribbon buttons.
-            for (id, params) in bridge.take_commands() {
-                let parsed: serde_json::Value = serde_json::from_str(&params).unwrap_or(serde_json::Value::Null);
-                match self.app.run(&id, parsed) {
-                    Ok(v) => {
-                        let detail = if id == "file.close" { format!("docs={}", self.app.session.documents().len()) } else { v.to_string() };
-                        bridge.post_response(true, &detail);
-                    }
-                    Err(e) => bridge.post_response(false, &e),
-                }
+            for (id, params, request_id) in bridge.take_commands() {
+                let result = self
+                    .app
+                    .run(&id, params)
+                    .map(|v| if id == "file.close" { serde_json::json!({ "docs": self.app.session.documents().len() }) } else { v });
+                bridge.post_response(&id, request_id.as_deref(), result);
             }
         }
         self.app.logic(ctx);
