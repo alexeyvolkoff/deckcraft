@@ -50,6 +50,8 @@ pub struct Bridge {
     closed_reported: Rc<Cell<bool>>,
     /// Commands the parent sent since the last frame: (id, params, request id).
     commands: Rc<RefCell<Vec<(String, Value, Option<String>)>>>,
+    /// Length of the `params` text of the commands that haven't run yet.
+    queued_bytes: Rc<Cell<usize>>,
     /// The uid of the presentation the host opened (the session keeps a blank deck around,
     /// so "closed" means the uid vanishing, not an empty document list).
     host_uid: Rc<Cell<Option<u64>>>,
@@ -75,6 +77,7 @@ impl Bridge {
             reported: Rc::default(),
             closed_reported: Rc::default(),
             commands: Rc::default(),
+            queued_bytes: Rc::default(),
             host_uid: Rc::default(),
         })
     }
@@ -102,6 +105,7 @@ impl Bridge {
 
     /// Commands the parent sent since the last frame, oldest first: (id, params, request id).
     pub fn take_commands(&self) -> Vec<(String, Value, Option<String>)> {
+        self.queued_bytes.set(0);
         std::mem::take(&mut *self.commands.borrow_mut())
     }
 
@@ -133,10 +137,13 @@ impl Bridge {
             None => Err("params must be a string of valid JSON".to_string()),
         };
         match parsed {
-            Ok(c) if !host_cmd::has_room(self.commands.borrow().len()) => {
+            Ok(c) if !host_cmd::has_room(self.commands.borrow().len(), self.queued_bytes.get(), c.params_bytes) => {
                 self.post_response(&c.id, c.request_id.as_deref(), Err("too many commands are waiting; try again".to_string()));
             }
-            Ok(c) => self.commands.borrow_mut().push((c.id, c.params, c.request_id)),
+            Ok(c) => {
+                self.queued_bytes.set(self.queued_bytes.get().saturating_add(c.params_bytes));
+                self.commands.borrow_mut().push((c.id, c.params, c.request_id));
+            }
             Err(error) => self.post_response(id.as_deref().unwrap_or(""), request_id.as_deref(), Err(error)),
         }
     }
