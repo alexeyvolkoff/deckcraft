@@ -52,6 +52,8 @@ pub struct Bridge {
     commands: Rc<RefCell<Vec<(String, Value, Option<String>)>>>,
     /// Length of the `params` text of the commands that haven't run yet.
     queued_bytes: Rc<Cell<usize>>,
+    /// Total length of the command identifiers that haven't run yet.
+    queued_id_bytes: Rc<Cell<usize>>,
     /// The uid of the presentation the host opened (the session keeps a blank deck around,
     /// so "closed" means the uid vanishing, not an empty document list).
     host_uid: Rc<Cell<Option<u64>>>,
@@ -78,6 +80,7 @@ impl Bridge {
             closed_reported: Rc::default(),
             commands: Rc::default(),
             queued_bytes: Rc::default(),
+            queued_id_bytes: Rc::default(),
             host_uid: Rc::default(),
         })
     }
@@ -106,6 +109,7 @@ impl Bridge {
     /// Commands the parent sent since the last frame, oldest first: (id, params, request id).
     pub fn take_commands(&self) -> Vec<(String, Value, Option<String>)> {
         self.queued_bytes.set(0);
+        self.queued_id_bytes.set(0);
         std::mem::take(&mut *self.commands.borrow_mut())
     }
 
@@ -125,13 +129,24 @@ impl Bridge {
     /// Queue the command in a `deckcraft:cmd` message, or answer the parent at once when the
     /// message doesn't fit.
     fn receive_command(&self, data: &JsValue) {
-        let params = js_sys::Reflect::get(data, &JsValue::from_str("params")).ok().filter(|v| !v.is_undefined() && !v.is_null());
-        let params = match params {
-            None => Some(None),
-            Some(v) => v.as_string().map(Some),
-        };
         let id = string(data, "id");
         let request_id = string(data, "requestId");
+        // Check the JavaScript string length before allocating the Rust copy, so an
+        // oversized `params` can't exhaust iframe memory before host_cmd::parse rejects it.
+        let params_value = js_sys::Reflect::get(data, &JsValue::from_str("params"))
+            .ok()
+            .filter(|v| !v.is_undefined() && !v.is_null());
+        let params = match params_value {
+            None => Some(None),
+            Some(v) => {
+                let js_len = v.dyn_ref::<js_sys::JsString>().map(|s| s.length() as usize);
+                if js_len.unwrap_or(usize::MAX) > host_cmd::MAX_PARAMS_BYTES {
+                    self.post_response(id.as_deref().unwrap_or(""), request_id.as_deref(), Err(format!("params are larger than {} bytes", host_cmd::MAX_PARAMS_BYTES)));
+                    return;
+                }
+                v.as_string().map(Some)
+            }
+        };
         let parsed = match params {
             Some(params) => host_cmd::parse(id.clone(), Some(params), request_id.clone()),
             None => Err("params must be a string of valid JSON".to_string()),
@@ -141,7 +156,13 @@ impl Bridge {
                 self.post_response(&c.id, c.request_id.as_deref(), Err("too many commands are waiting; try again".to_string()));
             }
             Ok(c) => {
+                let id_bytes = c.id.len() + c.request_id.as_deref().map(str::len).unwrap_or(0);
+                if self.queued_id_bytes.get().saturating_add(id_bytes) > host_cmd::MAX_PENDING_PARAMS_BYTES {
+                    self.post_response(&c.id, c.request_id.as_deref(), Err("too many commands are waiting; try again".to_string()));
+                    return;
+                }
                 self.queued_bytes.set(self.queued_bytes.get().saturating_add(c.params_bytes));
+                self.queued_id_bytes.set(self.queued_id_bytes.get().saturating_add(id_bytes));
                 self.commands.borrow_mut().push((c.id, c.params, c.request_id));
             }
             Err(error) => self.post_response(id.as_deref().unwrap_or(""), request_id.as_deref(), Err(error)),

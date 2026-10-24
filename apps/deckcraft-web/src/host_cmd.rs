@@ -18,6 +18,8 @@ pub const MAX_PENDING_COMMANDS: usize = 256;
 /// than their text.
 pub const MAX_PENDING_PARAMS_BYTES: usize = 8 << 20;
 
+pub const MAX_ID_BYTES: usize = 1024;
+
 /// Whether a command whose `params` text is `incoming_bytes` long fits in a queue that already
 /// holds `pending` commands with `pending_bytes` of `params` text.
 pub fn has_room(pending: usize, pending_bytes: usize, incoming_bytes: usize) -> bool {
@@ -38,6 +40,13 @@ pub struct Command {
 /// a missing or `null` one means `{}`. Nothing is run for a message that doesn't fit.
 pub fn parse(id: Option<String>, params: Option<Option<String>>, request_id: Option<String>) -> Result<Command, String> {
     let id = id.filter(|id| !id.trim().is_empty()).ok_or("a command needs an id")?;
+    if id.len() > MAX_ID_BYTES {
+        return Err(format!("id is larger than {MAX_ID_BYTES} bytes"));
+    }
+    let request_id = match request_id {
+        Some(r) if r.len() > MAX_ID_BYTES => return Err(format!("requestId is larger than {MAX_ID_BYTES} bytes")),
+        other => other,
+    };
     let (params, params_bytes) = match params {
         None | Some(None) => (json!({}), 0),
         Some(Some(text)) => {
