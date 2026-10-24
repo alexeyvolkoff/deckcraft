@@ -133,15 +133,17 @@ impl Bridge {
         let request_id = string(data, "requestId");
         // Check the JavaScript string length before allocating the Rust copy, so an
         // oversized `params` can't exhaust iframe memory before host_cmd::parse rejects it.
-        let params_value = js_sys::Reflect::get(data, &JsValue::from_str("params"))
-            .ok()
-            .filter(|v| !v.is_undefined() && !v.is_null());
+        let params_value = js_sys::Reflect::get(data, &JsValue::from_str("params")).ok().filter(|v| !v.is_undefined() && !v.is_null());
         let params = match params_value {
             None => Some(None),
             Some(v) => {
                 let js_len = v.dyn_ref::<js_sys::JsString>().map(|s| s.length() as usize);
                 if js_len.unwrap_or(usize::MAX) > host_cmd::MAX_PARAMS_BYTES {
-                    self.post_response(id.as_deref().unwrap_or(""), request_id.as_deref(), Err(format!("params are larger than {} bytes", host_cmd::MAX_PARAMS_BYTES)));
+                    self.post_response(
+                        id.as_deref().unwrap_or(""),
+                        request_id.as_deref(),
+                        Err(format!("params are larger than {} bytes", host_cmd::MAX_PARAMS_BYTES)),
+                    );
                     return;
                 }
                 v.as_string().map(Some)
