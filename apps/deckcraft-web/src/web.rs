@@ -40,6 +40,7 @@ pub fn start() {
                     if let Some(rs) = &cc.wgpu_render_state {
                         log::info!("deckcraft-web {}: wgpu backend {:?}", env!("CARGO_PKG_VERSION"), rs.adapter.get_info().backend);
                     }
+                    deckcraft_ui_egui::install_ime_pass_hooks(&cc.egui_ctx);
                     let inbox: Inbox = Inbox::default();
                     let mut app = SlideApp::new(Session::new(), services(inbox.clone(), cc.egui_ctx.clone()));
                     let q = query();
@@ -101,11 +102,6 @@ impl eframe::App for WebShell {
                     bridge.set_host_uid(d.uid);
                 }
                 let ext = name.rsplit('.').next().map(str::to_ascii_lowercase);
-                if matches!(ext.as_deref(), Some("pptx" | "potx" | "ppsx")) {
-                    // save_as_dialog writes PowerPoint formats as .pptx and .deckcraft files
-                    // as .deckcraft: potx/ppsx decks save back through the pptx branch.
-                    // (web_save_format dropped in upstream 0.11; the format is inferred on save)
-                }
                 ctx.request_repaint();
             }
             // Commands the host sent (`deckcraft:cmd`): run them like ribbon buttons.
